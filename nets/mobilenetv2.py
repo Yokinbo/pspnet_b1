@@ -72,7 +72,7 @@ class InvertedResidual(nn.Module):
             return self.conv(x)
 
 class MobileNetV2(nn.Module):
-    def __init__(self, n_class=1000, input_size=224, width_mult=1.):
+    def __init__(self, n_class=1000, input_size=224, width_mult=1., in_channels=3):
         super(MobileNetV2, self).__init__()
         block = InvertedResidual
         input_channel = 32
@@ -97,10 +97,13 @@ class MobileNetV2(nn.Module):
         ]
         
         assert input_size % 32 == 0
-        # 473,473,3 -> 237,237,32
+        # 第一步修改：
+        # 第一层卷积的输入通道数由 in_channels 控制，
+        # 这样同一套 PSPNet 可以兼容普通 RGB、Sentinel-2 四波段和六波段输入。
+        # 473,473,in_channels -> 237,237,32
         input_channel = int(input_channel * width_mult)
         self.last_channel = int(last_channel * width_mult) if width_mult > 1.0 else last_channel
-        self.features = [conv_bn(3, input_channel, 2)]
+        self.features = [conv_bn(in_channels, input_channel, 2)]
         
         # 根据上述列表进行循环，构建mobilenetv2的结构
         for t, c, n, s in interverted_residual_setting:
@@ -147,8 +150,17 @@ class MobileNetV2(nn.Module):
 
 
 
-def mobilenetv2(pretrained=False, **kwargs):
-    model = MobileNetV2(n_class=1000, **kwargs)
+def mobilenetv2(pretrained=False, in_channels=3, **kwargs):
+    model = MobileNetV2(n_class=1000, in_channels=in_channels, **kwargs)
     if pretrained:
-        model.load_state_dict(load_state_dict_from_url('https://github.com/bubbliiiing/pspnet-pytorch/releases/download/v1.0/mobilenet_v2.pth.tar', "./model_data"), strict=False)
+        # 当 in_channels != 3 时，预训练权重的第一层形状会对不上。
+        # 此时跳过原始 ImageNet 第一层权重，保留其余可匹配权重。
+        if in_channels == 3:
+            model.load_state_dict(load_state_dict_from_url('https://github.com/bubbliiiing/pspnet-pytorch/releases/download/v1.0/mobilenet_v2.pth.tar', "./model_data"), strict=False)
+        else:
+            pretrained_dict = load_state_dict_from_url('https://github.com/bubbliiiing/pspnet-pytorch/releases/download/v1.0/mobilenet_v2.pth.tar', "./model_data")
+            model_dict = model.state_dict()
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
     return model

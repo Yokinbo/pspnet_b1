@@ -7,10 +7,10 @@ from nets.resnet import resnet50
 
 
 class Resnet(nn.Module):
-    def __init__(self, dilate_scale=8, pretrained=True):
+    def __init__(self, dilate_scale=8, pretrained=True, in_channels=3):
         super(Resnet, self).__init__()
         from functools import partial
-        model = resnet50(pretrained)
+        model = resnet50(pretrained, in_channels=in_channels)
 
         #--------------------------------------------------------------------------------------------#
         #   根据下采样因子修改卷积的步长与膨胀系数
@@ -63,11 +63,11 @@ class Resnet(nn.Module):
         return x_aux, x
 
 class MobileNetV2(nn.Module):
-    def __init__(self, downsample_factor=8, pretrained=True):
+    def __init__(self, downsample_factor=8, pretrained=True, in_channels=3):
         super(MobileNetV2, self).__init__()
         from functools import partial
         
-        model = mobilenetv2(pretrained)
+        model = mobilenetv2(pretrained, in_channels=in_channels)
         self.features = model.features[:-1]
 
         self.total_idx = len(self.features)
@@ -138,11 +138,15 @@ class _PSPModule(nn.Module):
 
 
 class PSPNet(nn.Module):
-    def __init__(self, num_classes, downsample_factor, backbone="resnet50", pretrained=True, aux_branch=True):
+    def __init__(self, num_classes, downsample_factor, backbone="resnet50", pretrained=True, aux_branch=True, in_channels=3):
         super(PSPNet, self).__init__()
         norm_layer = nn.BatchNorm2d
         if backbone=="resnet50":
-            self.backbone = Resnet(downsample_factor, pretrained)
+            # 增加 in_channels 参数，让模型输入通道数不再固定为 3。
+            # - RGB 训练：in_channels=3
+            # - Sentinel-2 四波段：in_channels=4
+            # - Sentinel-2 六波段：in_channels=6
+            self.backbone = Resnet(downsample_factor, pretrained, in_channels=in_channels)
             aux_channel = 1024
             out_channel = 2048
         elif backbone=="mobilenet":
@@ -151,7 +155,8 @@ class PSPNet(nn.Module):
             #   f4为辅助分支    [30,30,96]
             #   o为主干部分     [30,30,320]
             #----------------------------------#
-            self.backbone = MobileNetV2(downsample_factor, pretrained)
+            # mobilenet 主干同样接收 in_channels，和 resnet50 保持一致。
+            self.backbone = MobileNetV2(downsample_factor, pretrained, in_channels=in_channels)
             aux_channel = 96
             out_channel = 320
         else:
@@ -183,6 +188,7 @@ class PSPNet(nn.Module):
             )
 
         self.initialize_weights(self.master_branch)
+        self.in_channels = in_channels
 
     def forward(self, x):
         input_size = (x.size()[2], x.size()[3])

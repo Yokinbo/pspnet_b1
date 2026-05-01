@@ -1,7 +1,15 @@
 import csv
 import os
+import tempfile
 from os.path import join
 
+import matplotlib
+
+# 多光谱 mIoU 常在 WSL / 服务器 / 无桌面环境里运行。
+# 这里强制使用 Agg 后台，只保存结果图，不弹出 Qt 窗口，避免 xcb 插件报错。
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib-cache"))
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -132,7 +140,7 @@ def adjust_axes(r, t, fig, axes):
     x_lim               = axes.get_xlim()
     axes.set_xlim([x_lim[0], x_lim[1] * propotion])
 
-def draw_plot_func(values, name_classes, plot_title, x_label, output_path, tick_font_size = 12, plt_show = True):
+def draw_plot_func(values, name_classes, plot_title, x_label, output_path, tick_font_size = 12, plt_show = False):
     fig     = plt.gcf() 
     axes    = plt.gca()
     plt.barh(range(len(values)), values, color='royalblue')
@@ -156,7 +164,7 @@ def draw_plot_func(values, name_classes, plot_title, x_label, output_path, tick_
 
 def show_results(miou_out_path, hist, IoUs, PA_Recall, Precision, name_classes, tick_font_size = 12):
     draw_plot_func(IoUs, name_classes, "mIoU = {0:.2f}%".format(np.nanmean(IoUs)*100), "Intersection over Union", \
-        os.path.join(miou_out_path, "mIoU.png"), tick_font_size = tick_font_size, plt_show = True)
+        os.path.join(miou_out_path, "mIoU.png"), tick_font_size = tick_font_size, plt_show = False)
     print("Save mIoU out to " + os.path.join(miou_out_path, "mIoU.png"))
 
     draw_plot_func(PA_Recall, name_classes, "mPA = {0:.2f}%".format(np.nanmean(PA_Recall)*100), "Pixel Accuracy", \

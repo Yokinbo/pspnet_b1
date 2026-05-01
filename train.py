@@ -9,6 +9,8 @@ import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
+from multispectral_config import (band_mode, image_ext, in_channels,
+                                  normalization_config, selected_bands)
 from nets.pspnet import PSPNet
 from nets.pspnet_training import (get_lr_scheduler, set_optimizer_lr,
                                   weights_init)
@@ -21,9 +23,8 @@ from utils.utils_fit import fit_one_epoch
 '''
 训练自己的语义分割模型一定需要注意以下几点：
 1、训练前仔细检查自己的格式是否满足要求，该库要求数据集格式为VOC格式，需要准备好的内容有输入图片和标签
-   输入图片为.jpg图片，无需固定大小，传入训练前会自动进行resize。
-   灰度图会自动转成RGB图片进行训练，无需自己修改。
-   输入图片如果后缀非jpg，需要自己批量转成jpg后再开始训练。
+   输入图片原始版本为.jpg图片；当前版本已经接入多光谱配置，可按 multispectral_config.py
+   读取 .tif 多波段影像，并通过 selected_bands 控制实际输入波段。
 
    标签为png图片，无需固定大小，传入训练前会自动进行resize。
    由于许多同学的数据集是网络上下载的，标签格式并不符合，需要再度处理。一定要注意！标签的每个像素点的值就是这个像素点所属的种类。
@@ -115,7 +116,7 @@ if __name__ == "__main__":
     #-------------------------------#
     #   输入图片的大小
     #-------------------------------#
-    input_shape         = [512, 512]
+    input_shape         = [256, 256]
     
     #----------------------------------------------------------------------------------------------------------------------------#
     #   训练分为两个阶段，分别是冻结阶段和解冻阶段。设置冻结阶段是为了满足机器性能不足的同学的训练需求。
@@ -159,7 +160,7 @@ if __name__ == "__main__":
     #                       (当Freeze_Train=False时失效)
     #------------------------------------------------------------------#
     Init_Epoch          = 0
-    Freeze_Epoch        = 100
+    Freeze_Epoch        = 30
     Freeze_batch_size   = 4
     #------------------------------------------------------------------#
     #   解冻阶段训练参数
@@ -168,7 +169,7 @@ if __name__ == "__main__":
     #   UnFreeze_Epoch          模型总共训练的epoch
     #   Unfreeze_batch_size     模型在解冻后的batch_size
     #------------------------------------------------------------------#
-    UnFreeze_Epoch      = 200
+    UnFreeze_Epoch      = 70
     Unfreeze_batch_size = 2
     #------------------------------------------------------------------#
     #   Freeze_Train    是否进行冻结训练
@@ -257,6 +258,14 @@ if __name__ == "__main__":
     #------------------------------------------------------------------#
     num_workers         = 2
 
+    # 为了避免 rgb / 4band / 6band 三组实验的输出混在一起，
+    # 这里把原始 save_dir 当作根目录，再按当前 band_mode 生成子目录：
+    #   logs/rgb
+    #   logs/4band
+    #   logs/6band
+    base_save_dir = save_dir
+    save_dir = os.path.join(base_save_dir, band_mode)
+
     seed_everything(seed)
     #------------------------------------------------------#
     #   设置用到的显卡
@@ -286,7 +295,8 @@ if __name__ == "__main__":
         else:
             download_weights(backbone)
 
-    model = PSPNet(num_classes=num_classes, backbone=backbone, downsample_factor=downsample_factor, pretrained=pretrained, aux_branch=aux_branch)
+    # 将 in_channels 传给模型，让网络结构与当前实际输入波段数一致。
+    model = PSPNet(num_classes=num_classes, backbone=backbone, downsample_factor=downsample_factor, pretrained=pretrained, aux_branch=aux_branch, in_channels=in_channels)
     if not pretrained:
         weights_init(model)
     if model_path != '':
@@ -324,7 +334,8 @@ if __name__ == "__main__":
     if local_rank == 0:
         time_str        = datetime.datetime.strftime(datetime.datetime.now(),'%Y_%m_%d_%H_%M_%S')
         log_dir         = os.path.join(save_dir, "loss_" + str(time_str))
-        loss_history    = LossHistory(log_dir, model, input_shape=input_shape)
+        # 传入 in_channels，避免 TensorBoard 画图时仍固定用 3 通道假输入。
+        loss_history    = LossHistory(log_dir, model, input_shape=input_shape, in_channels=in_channels)
     else:
         loss_history    = None
         
@@ -370,11 +381,18 @@ if __name__ == "__main__":
     num_val     = len(val_lines)
 
     if local_rank == 0:
+        # 把当前多光谱实验使用的“波段模式 + 标准化配置”一起打印出来。
+        # 这样每次训练日志里都能看到：
+        # - 当前到底是 rgb / 4band / 6band 哪一种输入
+        # - 实际读取哪些波段
+        # - 模型第一层输入通道数是多少
         show_config(
             num_classes = num_classes, backbone = backbone, model_path = model_path, input_shape = input_shape, \
+            band_mode = band_mode, image_ext = image_ext, selected_bands = selected_bands, in_channels = in_channels, \
+            normalization_config = normalization_config, base_save_dir = base_save_dir, save_dir = save_dir, \
             Init_Epoch = Init_Epoch, Freeze_Epoch = Freeze_Epoch, UnFreeze_Epoch = UnFreeze_Epoch, Freeze_batch_size = Freeze_batch_size, Unfreeze_batch_size = Unfreeze_batch_size, Freeze_Train = Freeze_Train, \
             Init_lr = Init_lr, Min_lr = Min_lr, optimizer_type = optimizer_type, momentum = momentum, lr_decay_type = lr_decay_type, \
-            save_period = save_period, save_dir = save_dir, num_workers = num_workers, num_train = num_train, num_val = num_val
+            save_period = save_period, num_workers = num_workers, num_train = num_train, num_val = num_val
         )
         #---------------------------------------------------------#
         #   总训练世代指的是遍历全部数据的总次数
@@ -445,8 +463,8 @@ if __name__ == "__main__":
         if epoch_step == 0 or epoch_step_val == 0:
             raise ValueError("数据集过小，无法继续进行训练，请扩充数据集。")
 
-        train_dataset   = PSPnetDataset(train_lines, input_shape, num_classes, True, VOCdevkit_path)
-        val_dataset     = PSPnetDataset(val_lines, input_shape, num_classes, False, VOCdevkit_path)
+        train_dataset   = PSPnetDataset(train_lines, input_shape, num_classes, True, VOCdevkit_path, image_ext=image_ext, selected_bands=selected_bands)
+        val_dataset     = PSPnetDataset(val_lines, input_shape, num_classes, False, VOCdevkit_path, image_ext=image_ext, selected_bands=selected_bands)
         
         if distributed:
             train_sampler   = torch.utils.data.distributed.DistributedSampler(train_dataset, shuffle=True,)
@@ -469,8 +487,10 @@ if __name__ == "__main__":
         #   记录eval的map曲线
         #----------------------#
         if local_rank == 0:
+            # 将 image_ext 和 selected_bands 传给评估模块，
+            # 保证训练中自动 mIoU 评估使用同一套多光谱输入配置。
             eval_callback   = EvalCallback(model, input_shape, num_classes, val_lines, VOCdevkit_path, log_dir, Cuda, \
-                                            eval_flag=eval_flag, period=eval_period)
+                                            eval_flag=eval_flag, period=eval_period, image_ext=image_ext, selected_bands=selected_bands)
         else:
             eval_callback   = None
         

@@ -4,11 +4,13 @@ import time
 
 import cv2
 import numpy as np
+import rasterio
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch import nn
 
+from multispectral_config import image_ext, in_channels, selected_bands, trained_model_path, vis_bands
 from nets.pspnet import PSPNet as pspnet
 from utils.utils import cvtColor, preprocess_input, resize_image, show_config
 
@@ -25,7 +27,10 @@ class PSPNet(object):
         #   训练好后logs文件夹下存在多个权值文件，选择验证集损失较低的即可。
         #   验证集损失较低不代表miou较高，仅代表该权值在验证集上泛化性能较好。
         #-------------------------------------------------------------------#
-        "model_path"        : 'logs/best_epoch_weights.pth',
+        # 第十步修改：
+        # 推理阶段默认使用的“训练好权重路径”统一从 multispectral_config.py 读取。
+        # 这不影响 train.py 里的预训练权重/断点训练配置。
+        "model_path"        : trained_model_path,
         #----------------------------------------#
         #   所需要区分的类的个数+1
         #----------------------------------------#
@@ -34,6 +39,20 @@ class PSPNet(object):
         #   所使用的的主干网络：mobilenet、resnet50
         #----------------------------------------#
         "backbone"          : "mobilenet",
+        #----------------------------------------#
+        #   第六步修改：推理阶段也支持多光谱输入
+        #   image_ext       推理时默认影像后缀
+        #   selected_bands  推理时实际使用的波段（1-based）
+        #   in_channels     自动由 selected_bands 长度得到
+        #   vis_bands       可视化叠加时使用的真彩色波段顺序
+        #----------------------------------------#
+        # 第九步修改：
+        # 这里也统一从 multispectral_config.py 读取多光谱配置，
+        # 避免 train / predict / get_miou / pspnet.py 四处不一致。
+        "image_ext"         : image_ext,
+        "selected_bands"    : selected_bands,
+        "vis_bands"         : vis_bands,
+        "in_channels"       : in_channels,
         #----------------------------------------#
         #   输入图片的大小
         #----------------------------------------#
@@ -65,6 +84,11 @@ class PSPNet(object):
         self.__dict__.update(self._defaults)
         for name, value in kwargs.items():
             setattr(self, name, value)
+        # 第六步修改：
+        # 若用户只改了 selected_bands，没有手动改 in_channels，
+        # 则这里自动同步，避免推理模型和输入通道数不一致。
+        if self.selected_bands is not None:
+            self.in_channels = len(self.selected_bands)
         #---------------------------------------------------#
         #   画框设置不同的颜色
         #---------------------------------------------------#
@@ -91,7 +115,9 @@ class PSPNet(object):
         #-------------------------------#
         #   载入模型与权值
         #-------------------------------#
-        self.net    = pspnet(num_classes=self.num_classes, downsample_factor=self.downsample_factor, pretrained=False, backbone=self.backbone, aux_branch=False)
+        # 第六步修改：
+        # 推理时构建模型也传入 in_channels，和训练阶段保持一致。
+        self.net    = pspnet(num_classes=self.num_classes, downsample_factor=self.downsample_factor, pretrained=False, backbone=self.backbone, aux_branch=False, in_channels=self.in_channels)
         
         device      = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.net.load_state_dict(torch.load(self.model_path, map_location=device), strict=False)
@@ -102,30 +128,96 @@ class PSPNet(object):
                 self.net = nn.DataParallel(self.net)
                 self.net = self.net.cuda()
 
+    def read_inference_image(self, image):
+        # 第六步修改：
+        # 推理输入支持三种形式：
+        # 1. 文件路径（.tif / 普通图片）
+        # 2. PIL.Image
+        # 3. numpy 数组
+        if isinstance(image, str):
+            if image.lower().endswith((".tif", ".tiff")):
+                with rasterio.open(image) as src:
+                    if self.selected_bands is None:
+                        band_indexes = list(range(1, src.count + 1))
+                    else:
+                        band_indexes = self.selected_bands
+                    arr = src.read(indexes=band_indexes)  # (C, H, W)
+                    arr = np.transpose(arr, (1, 2, 0))   # -> (H, W, C)
+                return arr
+            return Image.open(image)
+        return image
+
+    def resize_multiband_image(self, image, size):
+        # 第六步修改：
+        # 为多波段 numpy 影像补一个 resize + padding 版本。
+        ih, iw  = image.shape[:2]
+        w, h    = size
+
+        scale   = min(w / iw, h / ih)
+        nw      = int(iw * scale)
+        nh      = int(ih * scale)
+
+        image   = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        channels = image.shape[2]
+        new_image = np.zeros((h, w, channels), dtype=image.dtype)
+        new_image[(h - nh) // 2:(h - nh) // 2 + nh, (w - nw) // 2:(w - nw) // 2 + nw, :] = image
+        return new_image, nw, nh
+
+    def make_vis_image(self, image):
+        # 第六步修改：
+        # 多波段推理时，mix_type=0/2 仍需要一张 RGB 预览图来叠加显示结果。
+        if isinstance(image, Image.Image):
+            return copy.deepcopy(image)
+
+        image = np.asarray(image)
+        idx = [b - 1 for b in self.vis_bands]
+        rgb = image[:, :, idx].astype(np.float32)
+        out = np.zeros_like(rgb, dtype=np.uint8)
+        for i in range(rgb.shape[2]):
+            band = rgb[:, :, i]
+            low = np.percentile(band, 2)
+            high = np.percentile(band, 98)
+            if high <= low:
+                scaled = np.zeros_like(band, dtype=np.uint8)
+            else:
+                scaled = ((band - low) / (high - low) * 255.0).clip(0, 255).astype(np.uint8)
+            out[:, :, i] = scaled
+        return Image.fromarray(out)
+
+    def prepare_input(self, image):
+        # 第六步修改：
+        # 统一准备推理输入：
+        # - RGB/PIL 走原来的 resize_image
+        # - 多波段 numpy 走 resize_multiband_image
+        # 返回：
+        #   old_img      用于可视化叠加的原图预览
+        #   image_data   网络输入 BCHW
+        #   nw, nh       resize 后有效区域大小
+        #   orininal_h/w 原始尺寸
+        image = self.read_inference_image(image)
+
+        if isinstance(image, Image.Image):
+            image       = cvtColor(image)
+            old_img     = copy.deepcopy(image)
+            orininal_h  = np.array(image).shape[0]
+            orininal_w  = np.array(image).shape[1]
+            image_data, nw, nh = resize_image(image, (self.input_shape[1], self.input_shape[0]))
+            image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        else:
+            old_img     = self.make_vis_image(image)
+            orininal_h, orininal_w = image.shape[0], image.shape[1]
+            image_data, nw, nh = self.resize_multiband_image(np.array(image, np.float32), (self.input_shape[1], self.input_shape[0]))
+            image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+
+        return old_img, image_data, nw, nh, orininal_h, orininal_w
+
     #---------------------------------------------------#
     #   检测图片
     #---------------------------------------------------#
     def detect_image(self, image, count=False, name_classes=None):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------#
-        #   对输入图像进行一个备份，后面用于绘图
-        #---------------------------------------------------#
-        old_img     = copy.deepcopy(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        # 第六步修改：
+        # 推理输入现在统一由 prepare_input 准备，兼容 tif 多波段和普通 RGB。
+        old_img, image_data, nw, nh, orininal_h, orininal_w = self.prepare_input(image)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -210,20 +302,9 @@ class PSPNet(object):
         return image
 
     def get_FPS(self, image, test_interval):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        # 第六步修改：
+        # FPS 测试也与正式推理共用同一套多光谱输入准备逻辑。
+        _, image_data, nw, nh, _, _ = self.prepare_input(image)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)
@@ -268,7 +349,9 @@ class PSPNet(object):
         import onnx
         self.generate(onnx=True)
 
-        im                  = torch.zeros(1, 3, *self.input_shape).to('cpu')  # image size(1, 3, 512, 512) BCHW
+        # 第六步修改：
+        # 导出 onnx 时的假输入也改成当前 in_channels。
+        im                  = torch.zeros(1, self.in_channels, *self.input_shape).to('cpu')
         input_layer_names   = ["images"]
         output_layer_names  = ["output"]
         
@@ -303,22 +386,9 @@ class PSPNet(object):
         print('Onnx model save as {}'.format(model_path))
     
     def get_miou_png(self, image):
-        #---------------------------------------------------------#
-        #   在这里将图像转换成RGB图像，防止灰度图在预测时报错。
-        #   代码仅仅支持RGB图像的预测，所有其它类型的图像都会转化成RGB
-        #---------------------------------------------------------#
-        image       = cvtColor(image)
-        orininal_h  = np.array(image).shape[0]
-        orininal_w  = np.array(image).shape[1]
-        #---------------------------------------------------------#
-        #   给图像增加灰条，实现不失真的resize
-        #   也可以直接resize进行识别
-        #---------------------------------------------------------#
-        image_data, nw, nh  = resize_image(image, (self.input_shape[1],self.input_shape[0]))
-        #---------------------------------------------------------#
-        #   添加上batch_size维度
-        #---------------------------------------------------------#
-        image_data  = np.expand_dims(np.transpose(preprocess_input(np.array(image_data, np.float32)), (2, 0, 1)), 0)
+        # 第六步修改：
+        # mIoU 预测也复用正式推理的多光谱输入准备逻辑。
+        _, image_data, nw, nh, orininal_h, orininal_w = self.prepare_input(image)
 
         with torch.no_grad():
             images = torch.from_numpy(image_data)

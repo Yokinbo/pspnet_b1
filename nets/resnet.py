@@ -56,12 +56,14 @@ class Bottleneck(nn.Module):
 
 
 class ResNet(nn.Module):
-    def __init__(self, block, layers, num_classes=1000, dilated=False, deep_base=True, norm_layer=nn.BatchNorm2d):
+    def __init__(self, block, layers, num_classes=1000, dilated=False, deep_base=True, norm_layer=nn.BatchNorm2d, in_channels=3):
         self.inplanes = 128 if deep_base else 64
         super(ResNet, self).__init__()
         if deep_base:
             self.conv1 = nn.Sequential(
-                nn.Conv2d(3, 64, kernel_size=3, stride=2, padding=1, bias=False),
+                # resnet 第一层卷积同样改成由 in_channels 控制，
+                # 让 PSPNet-ResNet 主干也可以接收多光谱输入。
+                nn.Conv2d(in_channels, 64, kernel_size=3, stride=2, padding=1, bias=False),
                 norm_layer(64),
                 nn.ReLU(inplace=True),
                 nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1, bias=False),
@@ -70,7 +72,7 @@ class ResNet(nn.Module):
                 nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1, bias=False),
             )
         else:
-            self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3,
+            self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3,
                                    bias=False)
         self.bn1        = norm_layer(self.inplanes)
         self.relu       = nn.ReLU(inplace=True)
@@ -152,8 +154,17 @@ class ResNet(nn.Module):
 
         return x
 
-def resnet50(pretrained=False, **kwargs):
-    model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
+def resnet50(pretrained=False, in_channels=3, **kwargs):
+    model = ResNet(Bottleneck, [3, 4, 6, 3], in_channels=in_channels, **kwargs)
     if pretrained:
-        model.load_state_dict(load_state_dict_from_url(model_urls['resnet50'], "./model_data"), strict=False)
+        # 当 in_channels != 3 时，预训练权重的第一层形状会对不上。
+        # 此时跳过原始 ImageNet 第一层权重，保留其余可匹配权重。
+        if in_channels == 3:
+            model.load_state_dict(load_state_dict_from_url(model_urls['resnet50'], "./model_data"), strict=False)
+        else:
+            pretrained_dict = load_state_dict_from_url(model_urls['resnet50'], "./model_data")
+            model_dict = model.state_dict()
+            pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
+            model_dict.update(pretrained_dict)
+            model.load_state_dict(model_dict)
     return model

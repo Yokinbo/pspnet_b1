@@ -8,13 +8,21 @@ import cv2
 import numpy as np
 from PIL import Image
 
+from multispectral_config import image_ext, in_channels, selected_bands, trained_model_path
 from pspnet import PSPNet
 
 if __name__ == "__main__":
     #-------------------------------------------------------------------------#
     #   如果想要修改对应种类的颜色，到__init__函数里修改self.colors即可
     #-------------------------------------------------------------------------#
-    pspnet = PSPNet()
+    # 第十步修改：
+    # 推理阶段默认复用 multispectral_config.py 中的：
+    # - trained_model_path
+    # - image_ext
+    # - selected_bands
+    # - in_channels
+    # 这些配置现在统一从 multispectral_config.py 读取。
+    pspnet = PSPNet(model_path=trained_model_path, image_ext=image_ext, selected_bands=selected_bands, in_channels=in_channels)
     #----------------------------------------------------------------------------------------------------------#
     #   mode用于指定测试的模式：
     #   'predict'           表示单张图片预测，如果想对预测过程进行修改，如保存图片，截取对象等，可以先看下方详细的注释
@@ -86,7 +94,9 @@ if __name__ == "__main__":
         while True:
             img = input('Input image filename:')
             try:
-                image = Image.open(img)
+                # tif 多波段不能先用 PIL 打开，否则会丢掉多光谱信息。
+                # 这里把路径直接传给 PSPNet.detect_image，由内部按 selected_bands 读取。
+                image = img if img.lower().endswith((".tif", ".tiff")) else Image.open(img)
             except:
                 print('Open Error! Try again!')
                 continue
@@ -141,7 +151,7 @@ if __name__ == "__main__":
         cv2.destroyAllWindows()
 
     elif mode == "fps":
-        img = Image.open(fps_image_path)
+        img = fps_image_path if fps_image_path.lower().endswith((".tif", ".tiff")) else Image.open(fps_image_path)
         tact_time = pspnet.get_FPS(img, test_interval)
         print(str(tact_time) + ' seconds, ' + str(1/tact_time) + 'FPS, @batch_size 1')
         
@@ -154,7 +164,8 @@ if __name__ == "__main__":
         for img_name in tqdm(img_names):
             if img_name.lower().endswith(('.bmp', '.dib', '.png', '.jpg', '.jpeg', '.pbm', '.pgm', '.ppm', '.tif', '.tiff')):
                 image_path  = os.path.join(dir_origin_path, img_name)
-                image       = Image.open(image_path)
+                # tif 多波段不能先用 PIL 打开，否则会丢掉多光谱信息。
+                image       = image_path if img_name.lower().endswith((".tif", ".tiff")) else Image.open(image_path)
                 r_image     = pspnet.detect_image(image)
                 if not os.path.exists(dir_save_path):
                     os.makedirs(dir_save_path)
